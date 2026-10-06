@@ -251,18 +251,15 @@ impl PubSubListener {
         let pool = listener.pool.clone();
         let comms = listener.comms.clone();
         tasks::spawn("pub(crate) sub", async move {
-            loop {
-                select! {
-                    _ = comms.start.notified() => {}
-                    _ = comms.shutdown.cancelled() => {
-                        rx.close();
-                    }
+            select! {
+                _ = comms.start.notified() => {}
+                _ = comms.shutdown.cancelled() => {
+                    rx.close();
                 }
+            }
 
-                if rx.is_closed() {
-                    break;
-                }
-
+            // Reconnect until shutdown, re-subscribing to all channels.
+            while !rx.is_closed() {
                 select! {
                     _ = comms.shutdown.cancelled() => {
                         rx.close(); // Drain remaining messages.
@@ -279,10 +276,6 @@ impl PubSubListener {
                             }
                         }
                     }
-                }
-
-                if rx.is_closed() {
-                    break;
                 }
             }
         });
@@ -436,9 +429,13 @@ mod test {
     use std::{collections::HashMap, sync::Arc};
 
     use parking_lot::Mutex;
-    use tokio::sync::{Notify, mpsc};
+    use tokio::{
+        sync::{Notify, mpsc},
+        time::{sleep, timeout},
+    };
 
     use super::{test_support::TestChannel, *};
+    use crate::backend::{Server, server::test::test_server};
 
     fn test_user(user: &str, database: &str) -> User {
         User {
@@ -707,5 +704,67 @@ mod test {
             .expect("notify request");
 
         expect_notify(&mut rx, "events", "payload").await;
+    }
+
+    /// Find the listener backend by the last query it ran (its unique LISTEN),
+    /// so we don't touch pub/sub connections owned by concurrently running tests.
+    async fn listener_pid(conn: &mut Server, channel: &str) -> Option<String> {
+        let pids: Vec<String> = conn
+            .fetch_all(format!(
+                "SELECT pid::text FROM pg_stat_activity \
+                 WHERE application_name = 'PgDog Pub/Sub Listener' \
+                 AND query = 'LISTEN \"{channel}\"'"
+            ))
+            .await
+            .expect("query pg_stat_activity");
+        pids.into_iter().next()
+    }
+
+    async fn wait_for_listener_pid(conn: &mut Server, channel: &str, not: Option<&str>) -> String {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(pid) = listener_pid(conn, channel).await
+                    && Some(pid.as_str()) != not
+                {
+                    return pid;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("pub/sub listener connection did not (re)appear")
+    }
+
+    #[tokio::test]
+    async fn reconnects_and_resubscribes_after_connection_loss() {
+        let mut conn = test_server().await;
+        let channel = format!("pub_sub_reconnect_{}", std::process::id());
+
+        let pool = Pool::new_test();
+        let pub_sub = PubSubListener::new(&pool, &test_user("pgdog", "pgdog"), 0);
+        pub_sub.launch();
+
+        let mut listener = pub_sub.listen(&channel).await.expect("listen");
+        let first_pid = wait_for_listener_pid(&mut conn, &channel, None).await;
+
+        conn.execute_checked(format!("SELECT pg_terminate_backend({first_pid})"))
+            .await
+            .expect("terminate listener backend");
+
+        // The listener reconnects on its own and re-issues LISTEN.
+        wait_for_listener_pid(&mut conn, &channel, Some(&first_pid)).await;
+
+        conn.execute_checked(format!("NOTIFY \"{channel}\", 'after_reconnect'"))
+            .await
+            .expect("notify");
+
+        let notification = timeout(Duration::from_secs(10), listener.recv())
+            .await
+            .expect("notification after reconnect")
+            .expect("broadcast channel open");
+        assert_eq!(notification.channel(), channel);
+        assert_eq!(notification.payload(), "after_reconnect");
+
+        pub_sub.shutdown();
     }
 }
